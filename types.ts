@@ -10,6 +10,13 @@ export interface CategoryDefinition {
   isCustom: boolean;
 }
 
+export interface Budget {
+  id: string;
+  user_id: string;
+  category_name: string;
+  amount: number;
+}
+
 export interface Transaction {
   id: string;
   user_id: string;

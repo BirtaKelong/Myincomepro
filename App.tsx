@@ -15,6 +15,7 @@ const App: React.FC = () => {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [editingTransaction, setEditingTransaction] = useState<Transaction | null>(null);
   const [loading, setLoading] = useState(true);
+  const [dbError, setDbError] = useState<string | null>(null);
 
   // Auth States
   const [authEmail, setAuthEmail] = useState('');
@@ -22,25 +23,82 @@ const App: React.FC = () => {
   const [isSignUp, setIsSignUp] = useState(false);
   const [authError, setAuthError] = useState('');
 
+  const FULL_SQL_SCRIPT = `-- Copy and run this in Supabase SQL Editor:
+CREATE TABLE IF NOT EXISTS public.transactions (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    type TEXT NOT NULL CHECK (type IN ('income', 'expense')),
+    amount NUMERIC(15, 2) NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT,
+    date TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS public.categories (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('income', 'expense')),
+    color TEXT NOT NULL,
+    is_custom BOOLEAN DEFAULT true,
+    UNIQUE(user_id, name)
+);
+CREATE TABLE IF NOT EXISTS public.budgets (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+    category_name TEXT NOT NULL,
+    amount NUMERIC(15, 2) NOT NULL,
+    UNIQUE(user_id, category_name)
+);
+ALTER TABLE public.transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.budgets ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Users can manage their own transactions" ON public.transactions;
+DROP POLICY IF EXISTS "Users can manage their own categories" ON public.categories;
+DROP POLICY IF EXISTS "Users can manage their own budgets" ON public.budgets;
+CREATE POLICY "Users can manage their own transactions" ON public.transactions FOR ALL USING (auth.uid() = user_id);
+CREATE POLICY "Users can manage their own categories" ON public.categories FOR ALL USING (auth.uid() = user_id);
+CREATE POLICY "Users can manage their own budgets" ON public.budgets FOR ALL USING (auth.uid() = user_id);`;
+
   useEffect(() => {
-    const currentUser = storageService.getCurrentUser();
-    if (currentUser) {
-      setUser(currentUser);
-      initUserData(currentUser.id);
-    }
-    setLoading(false);
+    const checkAuth = async () => {
+      try {
+        const currentUser = await storageService.getCurrentUser();
+        if (currentUser) {
+          setUser(currentUser);
+          await initUserData(currentUser.id);
+        }
+      } catch (err) {
+        console.error("Auth check failed", err);
+      } finally {
+        setLoading(false);
+      }
+    };
+    checkAuth();
   }, []);
 
   const initUserData = async (userId: string) => {
-    const txData = await storageService.getTransactions(userId);
-    const catData = await storageService.getCustomCategories(userId);
-    setTransactions(txData);
-    setCustomCategories(catData);
+    try {
+      const [txData, catData] = await Promise.all([
+        storageService.getTransactions(userId),
+        storageService.getCustomCategories(userId)
+      ]);
+      setTransactions(txData);
+      setCustomCategories(catData);
+      setDbError(null);
+    } catch (err: any) {
+      if (err.message?.includes('schema cache') || err.message?.includes('relation') || err.message?.includes('not found')) {
+        setDbError('DATABASE_SETUP_REQUIRED');
+      } else {
+        console.error("Data fetch error", err);
+      }
+    }
   };
 
   const handleAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
+    setLoading(true);
     try {
       let loggedUser;
       if (isSignUp) {
@@ -49,54 +107,23 @@ const App: React.FC = () => {
         loggedUser = await storageService.signIn(authEmail, authPassword);
       }
       setUser(loggedUser);
-      initUserData(loggedUser.id);
+      await initUserData(loggedUser.id);
     } catch (err: any) {
-      setAuthError(err.message);
+      setAuthError(err.message || 'Authentication failed');
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleLogout = () => {
-    storageService.signOut();
+  const handleLogout = async () => {
+    await storageService.signOut();
     setUser(null);
     setTransactions([]);
     setCustomCategories([]);
+    setDbError(null);
   };
 
-  const handleSaveTransaction = async (data: any) => {
-    if (!user) return;
-    if (data.id) {
-      await storageService.updateTransaction(data);
-    } else {
-      await storageService.addTransaction(user.id, data);
-    }
-    const txData = await storageService.getTransactions(user.id);
-    setTransactions(txData);
-    setIsFormOpen(false);
-    setEditingTransaction(null);
-  };
-
-  const handleDeleteTransaction = async (id: string) => {
-    if (!user) return;
-    await storageService.deleteTransaction(id);
-    const txData = await storageService.getTransactions(user.id);
-    setTransactions(txData);
-  };
-
-  const handleAddCategory = async (name: string, type: TransactionType, color: string) => {
-    if (!user) return;
-    await storageService.addCustomCategory(user.id, { name, type, color });
-    const catData = await storageService.getCustomCategories(user.id);
-    setCustomCategories(catData);
-  };
-
-  const handleDeleteCategory = async (id: string) => {
-    if (!user) return;
-    await storageService.deleteCustomCategory(id);
-    const catData = await storageService.getCustomCategories(user.id);
-    setCustomCategories(catData);
-  };
-
-  if (loading) {
+  if (loading && !user) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-slate-50">
         <div className="w-12 h-12 border-4 border-slate-900 border-t-transparent rounded-full animate-spin"></div>
@@ -116,8 +143,8 @@ const App: React.FC = () => {
             </p>
             <div className="flex gap-8">
               <div>
-                <span className="block text-2xl font-bold">100%</span>
-                <span className="text-slate-500 text-sm uppercase font-semibold">Private Data</span>
+                <span className="block text-2xl font-bold">Cloud</span>
+                <span className="text-slate-500 text-sm uppercase font-semibold">Supabase Sync</span>
               </div>
               <div>
                 <span className="block text-2xl font-bold">AI</span>
@@ -163,9 +190,10 @@ const App: React.FC = () => {
             </div>
             <button
               type="submit"
-              className="w-full py-4 bg-slate-900 text-white rounded-xl font-bold hover:bg-slate-800 transition-all shadow-lg mt-4"
+              disabled={loading}
+              className="w-full py-4 bg-slate-900 text-white rounded-xl font-bold hover:bg-slate-800 transition-all shadow-lg mt-4 disabled:opacity-50"
             >
-              {isSignUp ? 'Sign Up' : 'Log In'}
+              {loading ? 'Authenticating...' : (isSignUp ? 'Sign Up' : 'Log In')}
             </button>
           </form>
 
@@ -178,6 +206,68 @@ const App: React.FC = () => {
               {isSignUp ? 'Log In' : 'Sign Up'}
             </button>
           </p>
+        </div>
+      </div>
+    );
+  }
+
+  if (dbError === 'DATABASE_SETUP_REQUIRED') {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="max-w-2xl w-full bg-white rounded-3xl shadow-xl border border-slate-200 overflow-hidden">
+          <div className="bg-rose-600 p-8 text-white">
+            <h2 className="text-2xl font-bold mb-2">Database Setup Required</h2>
+            <p className="text-rose-100 opacity-90">Tables are missing in your Supabase project. Please follow the steps below to initialize your database.</p>
+          </div>
+          <div className="p-8 space-y-6">
+            <div className="space-y-2">
+              <h3 className="font-bold text-slate-900 flex items-center gap-2">
+                <span className="w-6 h-6 rounded-full bg-slate-900 text-white flex items-center justify-center text-xs">1</span>
+                Open Supabase SQL Editor
+              </h3>
+              <p className="text-sm text-slate-500 pl-8">
+                Go to your Supabase dashboard and click on the **SQL Editor** in the sidebar.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <h3 className="font-bold text-slate-900 flex items-center gap-2">
+                <span className="w-6 h-6 rounded-full bg-slate-900 text-white flex items-center justify-center text-xs">2</span>
+                Paste and Run this SQL
+              </h3>
+              <p className="text-sm text-slate-500 pl-8 mb-2">
+                Copy the entire script below, paste it into a new query, and click **Run**.
+              </p>
+              <div className="relative group pl-8">
+                <pre className="text-[10px] bg-slate-900 text-indigo-300 p-4 rounded-xl overflow-x-auto whitespace-pre font-mono leading-relaxed max-h-60">
+                  {FULL_SQL_SCRIPT}
+                </pre>
+                <button 
+                  onClick={() => {
+                    navigator.clipboard.writeText(FULL_SQL_SCRIPT);
+                    alert('SQL copied to clipboard!');
+                  }}
+                  className="absolute top-2 right-2 bg-white/10 hover:bg-white/20 text-white text-[10px] px-2 py-1 rounded border border-white/20 transition-all"
+                >
+                  Copy Script
+                </button>
+              </div>
+            </div>
+            
+            <div className="pt-4 space-y-3">
+              <button 
+                onClick={() => window.location.reload()}
+                className="w-full py-4 bg-slate-900 text-white rounded-2xl font-bold hover:bg-slate-800 transition-all shadow-lg"
+              >
+                I've Run the SQL, Refresh App
+              </button>
+              <button 
+                onClick={handleLogout}
+                className="w-full text-slate-500 text-sm font-medium hover:text-slate-900"
+              >
+                Logout and Try Later
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     );
@@ -211,7 +301,7 @@ const App: React.FC = () => {
               onClick={() => setActiveTab('categories')}
               className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-semibold transition-all ${activeTab === 'categories' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-500 hover:bg-slate-100'}`}
             >
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 7h.01M7 11h.01M7 15h.01M11 7h.01M11 11h.01M11 15h.01M15 7h.01M15 11h.01M15 15h.01M19 7h.01M19 11h.01M19 15h.01M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2z"></path></svg>
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 7h.01M7 11h.01M7 15h.01M11 7h.01M11 11h.01M11 15h.01M15 7h.01M15 11h.01M15 15h.01M19 7h.01M19 11h.01M19 15h.01M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2-2v10a2 2 0 002 2z"></path></svg>
               Categories
             </button>
           </nav>
@@ -224,7 +314,7 @@ const App: React.FC = () => {
             </div>
             <div className="flex-1 overflow-hidden">
               <p className="text-sm font-bold text-slate-900 truncate">{user.email}</p>
-              <p className="text-xs text-slate-400">Personal Account</p>
+              <p className="text-xs text-slate-400">Cloud Account</p>
             </div>
           </div>
           <button
@@ -258,13 +348,13 @@ const App: React.FC = () => {
             transactions={transactions} 
             customCategories={customCategories}
             onEdit={(tx) => { setEditingTransaction(tx); setIsFormOpen(true); }}
-            onDelete={handleDeleteTransaction}
+            onDelete={(id) => { storageService.deleteTransaction(id).then(() => initUserData(user.id)) }}
           />
         ) : (
           <CategoryManager 
             customCategories={customCategories}
-            onAdd={handleAddCategory}
-            onDelete={handleDeleteCategory}
+            onAdd={(n, t, c) => { storageService.addCustomCategory(user.id, {name: n, type: t, color: c}).then(() => initUserData(user.id)) }}
+            onDelete={(id) => { storageService.deleteCustomCategory(id).then(() => initUserData(user.id)) }}
           />
         )}
       </main>
@@ -292,7 +382,14 @@ const App: React.FC = () => {
 
       {isFormOpen && (
         <TransactionForm 
-          onSave={handleSaveTransaction}
+          onSave={(data) => {
+            const saveOp = data.id ? storageService.updateTransaction(data) : storageService.addTransaction(user.id, data);
+            saveOp.then(() => {
+              initUserData(user.id);
+              setIsFormOpen(false);
+              setEditingTransaction(null);
+            });
+          }}
           onCancel={() => { setIsFormOpen(false); setEditingTransaction(null); }}
           initialData={editingTransaction}
           customCategories={customCategories}
